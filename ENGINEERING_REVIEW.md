@@ -44,3 +44,40 @@ The CLI was also invoked with a nonexistent data directory. It exited with code 
 ## Not run / limitations
 
 A complete training and evaluation run was **not** claimed. The repository has no image data or saved artifacts, and TensorFlow is not installed in the audit environment. Consequently, there are no measured accuracy, loss, or clinical-performance claims in this review. Installing the declared dependencies and supplying an authorized dataset are prerequisites for a real run. The dataset source/provenance, patient identifiers, acquisition grouping, and semantic near-duplicate policy are not included and must be reviewed before interpreting any future metrics.
+
+
+## Second Senior Review
+
+### Scope and findings
+
+The second review re-read every tracked file, the complete notebook, Python/config/test/README/requirements files, and Git history/diff. The working tree was clean at review start. No credentials, hard-coded secrets, tracked dataset, model weights, generated result artifact, or additional hidden application/UI/API file was present.
+
+The remaining actionable gaps were:
+
+- Dataset validation checked extensions and aggregate split counts, but did not require every class to contain an image or verify that image bytes were decodable.
+- Exact duplicate detection covered train/test leakage but did not catch identical bytes assigned to contradictory labels within one split.
+- Public validation accepted malformed notebook root/cell/source structures and did not reject all obsolete training argument names.
+- Metric input validation converted labels to integers, which could silently coerce non-integral numeric labels.
+
+### Fixes in this review
+
+- Added explicit image-size and non-negative-seed validation, per-class non-empty checks, Pillow `verify()` checks for every supported image, and within-split cross-label duplicate detection.
+- Tightened `classification_metrics` to require finite binary labels and probabilities in `[0, 1]` without coercion of fractional labels.
+- Hardened notebook validation for root/cell/source schema and stale code-only fields; added checks for `nb_epoch` and `nb_val_samples`.
+- Added targeted tests for empty classes, contradictory same-split labels, invalid metric inputs, undecodable images, and the static notebook validator. Added Pillow as an explicit dependency for the image contract.
+- Updated the README to document these checks and the remaining limits of exact-byte leakage detection.
+
+### Second-review validation
+
+```text
+python validate_repository.py
+python -m compileall -q malaria_pipeline.py validate_repository.py tests
+pytest -q
+ruff check .
+```
+
+The complete training/evaluation path was not run: this checkout has no authorized image dataset or saved artifacts, and TensorFlow is not installed in the audit environment. No metrics were fabricated or claimed. The local commit created for this review is the source of truth for the changes above; nothing was pushed.
+
+### Remaining risks
+
+Patient-level leakage, semantic near-duplicates, provenance/licensing, label quality, class imbalance, calibration, confidence intervals, external validation, and clinical suitability still require dataset/domain review. TensorFlow/Keras behavior and determinism remain version/hardware dependent. The notebook is an output-free wrapper and is not an interactive production UI or saved-model serving API.

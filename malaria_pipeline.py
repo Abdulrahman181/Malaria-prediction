@@ -39,6 +39,31 @@ def _class_directories(directory: Path) -> list[Path]:
     return sorted(path for path in directory.iterdir() if path.is_dir())
 
 
+def _validate_image_size(image_size: tuple[int, int]) -> tuple[int, int]:
+    if (
+        not isinstance(image_size, tuple)
+        or len(image_size) != 2
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+            for value in image_size
+        )
+    ):
+        raise ValueError("image_size must be a tuple of two positive integers")
+    return image_size
+
+
+def _validate_seed(seed: int) -> None:
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError("seed must be a non-negative integer")
+
+
+def _class_image_counts(directory: Path) -> dict[str, int]:
+    return {
+        class_dir.name: len(_image_files(class_dir))
+        for class_dir in _class_directories(directory)
+    }
+
+
 def resolve_dataset_dir(root: str | Path) -> DatasetPaths:
     """Validate the expected directory layout and return absolute paths.
 
@@ -74,12 +99,17 @@ def resolve_dataset_dir(root: str | Path) -> DatasetPaths:
         )
 
     counts = {
-        "training_set": len(_image_files(train_dir)),
-        "testing_set": len(_image_files(test_dir)),
+        "training_set": _class_image_counts(train_dir),
+        "testing_set": _class_image_counts(test_dir),
     }
-    empty = [name for name, count in counts.items() if count == 0]
+    empty = [
+        f"{split}/{label}"
+        for split, class_counts in counts.items()
+        for label, count in class_counts.items()
+        if count == 0
+    ]
     if empty:
-        raise ValueError(f"No supported image files found in {', '.join(empty)}.")
+        raise ValueError(f"No supported image files found in: {', '.join(empty)}.")
 
     return DatasetPaths(root=root_path, train=train_dir, test=test_dir)
 
@@ -112,8 +142,50 @@ def find_cross_split_duplicates(paths: DatasetPaths) -> list[tuple[Path, Path]]:
     return duplicates
 
 
+def find_within_split_label_conflicts(paths: DatasetPaths) -> list[tuple[Path, Path]]:
+    """Find identical bytes assigned to different classes within one split."""
+
+    conflicts: list[tuple[Path, Path]] = []
+    for split in (paths.train, paths.test):
+        by_hash: dict[str, tuple[str, Path]] = {}
+        for path in _image_files(split):
+            digest = _sha256(path)
+            relative_parts = path.relative_to(split).parts
+            if not relative_parts:
+                continue
+            label = relative_parts[0]
+            previous = by_hash.get(digest)
+            if previous is not None and previous[0] != label:
+                conflicts.append((previous[1], path))
+            else:
+                by_hash.setdefault(digest, (label, path))
+    return conflicts
+
+
+def _validate_image_contents(paths: DatasetPaths) -> None:
+    """Reject files with image extensions that Pillow cannot decode."""
+
+    try:
+        from PIL import Image, UnidentifiedImageError
+    except ImportError as exc:  # pragma: no cover - dependency error path
+        raise RuntimeError(
+            "Pillow is required to validate dataset images; install requirements.txt first."
+        ) from exc
+
+    invalid: list[Path] = []
+    for path in _image_files(paths.train) + _image_files(paths.test):
+        try:
+            with Image.open(path) as image:
+                image.verify()
+        except (OSError, UnidentifiedImageError):
+            invalid.append(path)
+    if invalid:
+        examples = ", ".join(str(path) for path in invalid[:3])
+        raise ValueError(f"Found {len(invalid)} unreadable image file(s); examples: {examples}")
+
+
 def validate_dataset_integrity(paths: DatasetPaths) -> None:
-    """Fail closed when exact byte-identical train/test images are detected."""
+    """Fail closed on duplicates, contradictory labels, or unreadable images."""
 
     duplicates = find_cross_split_duplicates(paths)
     if duplicates:
@@ -123,11 +195,20 @@ def validate_dataset_integrity(paths: DatasetPaths) -> None:
             "indicating data leakage. "
             f"Examples: {examples}"
         )
+    conflicts = find_within_split_label_conflicts(paths)
+    if conflicts:
+        examples = "; ".join(f"{first} == {second}" for first, second in conflicts[:3])
+        raise ValueError(
+            f"Detected {len(conflicts)} exact duplicate image(s) assigned to different classes "
+            f"within a split. Examples: {examples}"
+        )
+    _validate_image_contents(paths)
 
 
 def set_global_seed(seed: int) -> None:
     """Set Python, NumPy, and TensorFlow seeds when the ML stack is available."""
 
+    _validate_seed(seed)
     import random
 
     random.seed(seed)
@@ -163,7 +244,7 @@ def build_model(image_size: tuple[int, int] = (64, 64)) -> Any:
             "TensorFlow is required to build the model; install requirements.txt first."
         ) from exc
 
-    height, width = image_size
+    height, width = _validate_image_size(image_size)
     model = tf.keras.Sequential(
         [
             tf.keras.Input(shape=(height, width, 3)),
@@ -202,7 +283,9 @@ def create_generators(
     stopping. Validation is carved out of training_set with a fixed seed.
     """
 
-    if batch_size < 1:
+    _validate_image_size(image_size)
+    _validate_seed(seed)
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
         raise ValueError("batch_size must be positive")
     if not 0 < validation_fraction < 1:
         raise ValueError("validation_fraction must be between 0 and 1")
@@ -243,6 +326,13 @@ def create_generators(
     )
     if train.class_indices != validation.class_indices or train.class_indices != test.class_indices:
         raise ValueError("Class-to-index mappings differ between data splits; refusing to train.")
+    expected_labels = set(range(len(common["classes"])))
+    for name, generator in (("training", train), ("validation", validation), ("testing", test)):
+        if generator.samples == 0 or set(generator.classes) != expected_labels:
+            raise ValueError(
+                f"The {name} split must contain at least one image for every class; "
+                f"found {generator.samples} samples with labels {sorted(set(generator.classes))}."
+            )
     return train, validation, test
 
 
@@ -262,15 +352,31 @@ def classification_metrics(
             "NumPy is required to calculate metrics; install requirements.txt first."
         ) from exc
 
-    truth = np.asarray(list(y_true), dtype=np.int64).reshape(-1)
+    truth = np.asarray(list(y_true), dtype=float).reshape(-1)
     probability = np.asarray(list(y_probability), dtype=float).reshape(-1)
+    if isinstance(threshold, bool):
+        raise ValueError("threshold must be a finite number between 0 and 1.")
+    try:
+        threshold_value = float(threshold)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("threshold must be a finite number between 0 and 1.") from exc
     if truth.size == 0 or truth.size != probability.size:
         raise ValueError("y_true and y_probability must be non-empty and have equal length.")
-    if not np.isin(truth, [0, 1]).all():
+    if not np.isfinite(truth).all() or not np.isin(truth, [0, 1]).all():
         raise ValueError("y_true must contain only binary labels 0 and 1.")
-    if not np.isfinite(probability).all() or not 0 <= threshold <= 1:
-        raise ValueError("Probabilities must be finite and threshold must be between 0 and 1.")
-    predicted = (probability >= threshold).astype(np.int64)
+    probabilities_in_range = (0 <= probability).all() and (probability <= 1).all()
+    if (
+        not np.isfinite(probability).all()
+        or not probabilities_in_range
+        or not np.isfinite(threshold_value)
+        or not 0 <= threshold_value <= 1
+    ):
+        raise ValueError(
+            "Probabilities must be finite values between 0 and 1, and threshold must be "
+            "between 0 and 1."
+        )
+    truth = truth.astype(np.int64)
+    predicted = (probability >= threshold_value).astype(np.int64)
     tp = int(((truth == 1) & (predicted == 1)).sum())
     tn = int(((truth == 0) & (predicted == 0)).sum())
     fp = int(((truth == 0) & (predicted == 1)).sum())
@@ -284,7 +390,7 @@ def classification_metrics(
         else 2 * precision * recall / (precision + recall)
     )
     return {
-        "threshold": float(threshold),
+        "threshold": threshold_value,
         "accuracy": _safe_ratio(tp + tn, truth.size),
         "precision": precision,
         "recall": recall,

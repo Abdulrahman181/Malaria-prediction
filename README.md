@@ -34,7 +34,7 @@ Obtain the dataset from an authorized source and keep it outside Git. Set `MALAR
     └── <class-b>/image files...
 ```
 
-Both splits must contain the same exactly two class-directory names and supported image files (`bmp`, `gif`, `jpeg`, `jpg`, `png`, `tif`, or `tiff`). Missing or malformed data stops with an actionable error; no data is generated or silently substituted. Exact byte-identical images across training and testing are rejected as leakage.
+Both splits must contain the same exactly two class-directory names, with at least one supported image in every class (`bmp`, `gif`, `jpeg`, `jpg`, `png`, `tif`, or `tiff`). Missing, undecodable, or malformed data stops with an actionable error; no data is generated or silently substituted. Exact byte-identical images across training and testing, and identical bytes assigned to different classes within a split, are rejected as leakage or label contradiction.
 
 ## Training and evaluation
 
@@ -53,4 +53,4 @@ The pipeline creates a fixed-seed validation subset from `training_set`. Augment
 
 ## Reproducibility and limitations
 
-The default seed is 42 and the pipeline requests TensorFlow deterministic operations when supported. Exact reproducibility can still depend on TensorFlow, CUDA/CPU kernels, hardware, and library versions. The repository does not include a data provenance record, model weights, or measured performance. Do not interpret this educational classifier as a clinical diagnostic device; any clinical use would require an appropriately designed, independently validated study.
+The default seed is 42 and the pipeline requests TensorFlow deterministic operations when supported. Exact reproducibility can still depend on TensorFlow, CUDA/CPU kernels, hardware, and library versions. The repository does not include a data provenance record, model weights, or measured performance. Exact-byte checks do not detect semantic near-duplicates or patient-level overlap. Do not interpret this educational classifier as a clinical diagnostic device; any clinical use would require an appropriately designed, independently validated study.
